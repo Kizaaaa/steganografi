@@ -873,8 +873,6 @@ class MP3Steganography:
         print("="*60)
         
         return True
-
-
     
 def main():
     print("MP3 LSB STEGANOGRAPHY TOOL")
@@ -932,25 +930,6 @@ def main():
             print("Seed tidak boleh kosong!")
             return
         
-        # Konfirmasi
-        print("\n" + "="*60)
-        print("RINGKASAN:")
-        print("="*60)
-        print(f"  Carrier MP3    : {mp3_path}")
-        print(f"  File rahasia   : {hidden_file}")
-        print(f"  Output         : {output_path}")
-        print(f"  LSB count      : {lsb_count}")
-        print(f"  Enkripsi       : {' Ya' if encrypt else 'Tidak'}")
-        print(f"  Randomisasi    : {' Ya' if randomize else 'Tidak'}")
-        print(f"  Seed           : {'*' * len(seed)}")
-        print("="*60)
-        
-        confirm = input("\nLanjutkan? (y/n): ").strip().lower()
-        
-        if confirm != 'y':
-            print("Dibatalkan")
-            return
-        
         # Execute embed
         try:
             stego.embed_file(
@@ -978,21 +957,6 @@ def main():
         output_dir = input("Directory output [default: .]: ").strip()
         if not output_dir:
             output_dir = "."
-        
-        # Konfirmasi
-        print("\n" + "="*60)
-        print("RINGKASAN:")
-        print("="*60)
-        print(f"  Stego MP3      : {stego_path}")
-        print(f"  Seed           : {'*' * len(seed)}")
-        print(f"  Output dir     : {output_dir}")
-        print("="*60)
-        
-        confirm = input("\nLanjutkan? (y/n): ").strip().lower()
-        
-        if confirm != 'y':
-            print("Dibatalkan")
-            return
         
         # Execute extract
         try:
