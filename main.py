@@ -1,626 +1,1025 @@
 import os
 import random
 import hashlib
-from typing import List, Tuple
+import struct
+import json
+import traceback
+from typing import List, Dict, Tuple, Optional
+from psnr import psnr
 
 class VigenereCipher:
     @staticmethod
-    def encrypt(plaintext: str, key: str) -> str:
-        key = key.upper()
-        encrypted = ""
-        key_index = 0
-        
-        for char in plaintext:
-            if char.isalpha():
-                shift = ord(key[key_index % len(key)]) - ord('A')
-                if char.isupper():
-                    encrypted_char = chr((ord(char) - ord('A') + shift) % 26 + ord('A'))
-                else:
-                    encrypted_char = chr((ord(char.upper()) - ord('A') + shift) % 26 + ord('A')).lower()
-                encrypted += encrypted_char
-                key_index += 1
-            else:
-                encrypted += char
-        
-        return encrypted
-    
+    def _to_bytes(x):
+        if isinstance(x, bytes):
+            return x
+        if isinstance(x, str):
+            return x.encode('utf-8')
+
     @staticmethod
-    def decrypt(ciphertext: str, key: str) -> str:
-        """Decrypt text using Vigenere cipher - preserves case and non-alphabetic chars"""
-        key = key.upper()
-        decrypted = ""
-        key_index = 0
-        
-        for char in ciphertext:
-            if char.isalpha():
-                shift = ord(key[key_index % len(key)]) - ord('A')
-                if char.isupper():
-                    decrypted_char = chr((ord(char) - ord('A') - shift + 26) % 26 + ord('A'))
-                else:
-                    decrypted_char = chr((ord(char.upper()) - ord('A') - shift + 26) % 26 + ord('A')).lower()
-                decrypted += decrypted_char
-                key_index += 1
-            else:
-                decrypted += char
-        
-        return decrypted
+    def encrypt(data, key):
+        data_b = VigenereCipher._to_bytes(data)
+        key_b = VigenereCipher._to_bytes(key)
+        if len(key_b) == 0:
+            return
+
+        out = bytearray(len(data_b))
+        for i, b in enumerate(data_b):
+            shift = key_b[i % len(key_b)]
+            out[i] = (b + shift) & 0xFF
+        return bytes(out)
+
+    @staticmethod
+    def decrypt(data, key):
+        data_b = VigenereCipher._to_bytes(data)
+        key_b = VigenereCipher._to_bytes(key)
+        if len(key_b) == 0:
+            return
+
+        out = bytearray(len(data_b))
+        for i, b in enumerate(data_b):
+            shift = key_b[i % len(key_b)]
+            out[i] = (b - shift) & 0xFF
+        return bytes(out)   
 
 class MP3Steganography:
     def __init__(self):
-        self.magic_header = b"STEGO"  # Magic bytes to identify steganographic content
-        self.end_marker = b"ENDSTEGO"  # End marker
+        self.FRAME_SYNC = 0xFFE0
+        self.MAGIC_HEADER = b'MP3STEGO'  # Magic bytes untuk identifikasi
+        self.VERSION = 1
     
-    def _embed_bits(self, byte_val: int, bits: int, lsb_count: int) -> int:
-        """Embed multiple bits into the LSBs of a byte"""
-        # Create mask to clear the LSBs we want to modify
-        mask = (0xFF << lsb_count) & 0xFF
-        # Clear the LSBs and set the new bits
-        return (byte_val & mask) | (bits & ((1 << lsb_count) - 1))
+    def _generate_seed_hash(self, seed: str) -> int:
+        return int(hashlib.sha256(seed.encode()).hexdigest(), 16) % (2**32)
     
-    def _extract_bits(self, byte_val: int, lsb_count: int) -> int:
-        """Extract multiple bits from the LSBs of a byte"""
-        return byte_val & ((1 << lsb_count) - 1)
+    def _is_valid_header(self, header: int) -> bool:
+        if (header >> 21) != 0x7FF:
+            return False
+        
+        version_bits = (header >> 19) & 0x03
+        layer_bits = (header >> 17) & 0x03
+        bitrate_index = (header >> 12) & 0x0F
+        samplerate_index = (header >> 10) & 0x03
+        
+        if version_bits == 1:  # Reserved
+            return False
+        if layer_bits == 0:  # Reserved
+            return False
+        if bitrate_index == 15:  # Bad bitrate
+            return False
+        if samplerate_index == 3:  # Reserved
+            return False
+        
+        return True
     
-    def _create_flag_bits(self, randomize: bool, encrypt: bool, lsb_count: int) -> List[int]:
-        """Create 4-bit flag: [random_bit, encrypt_bit, lsb_bit1, lsb_bit0]"""
-        random_bit = 1 if randomize else 0
-        encrypt_bit = 1 if encrypt else 0
+    def _get_frame_length(self, header: int) -> int:
+        # Bitrate tables
+        bitrate_table_v1_l3 = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0]
+        bitrate_table_v2_l3 = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0]
         
-        # Convert lsb_count (1-4) to 2 bits (00-11)
-        lsb_bits = lsb_count - 1  # Convert 1-4 to 0-3
-        lsb_bit1 = (lsb_bits >> 1) & 1
-        lsb_bit0 = lsb_bits & 1
+        samplerate_table_v1 = [44100, 48000, 32000, 0]
+        samplerate_table_v2 = [22050, 24000, 16000, 0]
+        samplerate_table_v25 = [11025, 12000, 8000, 0]
         
-        return [random_bit, encrypt_bit, lsb_bit1, lsb_bit0]
+        # Parse header bits
+        version_bits = (header >> 19) & 0x03
+        layer_bits = (header >> 17) & 0x03
+        bitrate_index = (header >> 12) & 0x0F
+        samplerate_index = (header >> 10) & 0x03
+        padding = (header >> 9) & 0x01
+        
+        # Validate
+        if bitrate_index == 0 or bitrate_index == 15:
+            return 0
+        if samplerate_index == 3:
+            return 0
+        
+        # Determine version
+        if version_bits == 3:  # MPEG Version 1
+            version = 1
+            samplerate_table = samplerate_table_v1
+            bitrate_table = bitrate_table_v1_l3
+        elif version_bits == 2:  # MPEG Version 2
+            version = 2
+            samplerate_table = samplerate_table_v2
+            bitrate_table = bitrate_table_v2_l3
+        elif version_bits == 0:  # MPEG Version 2.5
+            version = 25
+            samplerate_table = samplerate_table_v25
+            bitrate_table = bitrate_table_v2_l3
+        else:
+            return 0
+        
+        # Determine layer
+        if layer_bits == 1:  # Layer III
+            layer = 3
+        elif layer_bits == 2:  # Layer II
+            layer = 2
+        elif layer_bits == 3:  # Layer I
+            layer = 1
+        else:
+            return 0
+        
+        # Get bitrate and samplerate
+        bitrate = bitrate_table[bitrate_index] * 1000
+        samplerate = samplerate_table[samplerate_index]
+        
+        if samplerate == 0:
+            return 0
+        
+        # Calculate frame length based on layer
+        if layer == 3:  # Layer III (MP3)
+            if version == 1:  # MPEG1
+                frame_length = int(144 * bitrate / samplerate) + padding
+            else:  # MPEG2, MPEG2.5
+                frame_length = int(72 * bitrate / samplerate) + padding
+        elif layer == 2:  # Layer II
+            frame_length = int(144 * bitrate / samplerate) + padding
+        elif layer == 1:  # Layer I
+            frame_length = int((12 * bitrate / samplerate) + padding) * 4
+        else:
+            return 0
+        
+        # Sanity check: frame length should be reasonable
+        if frame_length < 24 or frame_length > 2881:  # Min/max valid MP3 frame sizes
+            return 0
+        
+        return frame_length
     
-    def _parse_flag_bits(self, flag_bits: List[int]) -> Tuple[bool, bool, int]:
-        """Parse 4-bit flag to get randomize, encrypt, and lsb_count"""
-        if len(flag_bits) < 4:
-            return False, False, 1
+    def _skip_id3_tags(self, data: bytes) -> int:
+        if len(data) < 10:
+            return 0
         
-        randomize = flag_bits[0] == 1
-        encrypt = flag_bits[1] == 1
+        # Check ID3v2 tag
+        if data[0:3] == b'ID3':
+            # ID3v2 size is in bytes 6-9 (synchsafe integer)
+            size = ((data[6] & 0x7F) << 21) | \
+                   ((data[7] & 0x7F) << 14) | \
+                   ((data[8] & 0x7F) << 7) | \
+                   (data[9] & 0x7F)
+            
+            return size + 10  # Header is 10 bytes
         
-        # Convert 2 LSB bits back to count (0-3 becomes 1-4)
-        lsb_value = (flag_bits[2] << 1) | flag_bits[3]
-        lsb_count = lsb_value + 1
-        
-        return randomize, encrypt, lsb_count
+        return 0
     
-    def _generate_safe_positions(self, mp3_data: bytes) -> List[int]:
-        """Generate safe positions for data embedding"""
-        safe_positions = []
+    def _find_frames(self, data: bytes) -> List[Dict]:
+        frames = []
+        i = 0
+        consecutive_failures = 0
+        max_failures = 10  # Stop jika terlalu banyak kegagalan berturut-turut
         
-        # Skip ID3v2 header if present
-        start_pos = 0
-        if len(mp3_data) >= 10 and mp3_data[:3] == b'ID3':
-            size = int.from_bytes(mp3_data[6:10], 'big')
-            # ID3v2 size is synchsafe integer
-            size = ((size & 0x7f000000) >> 3) | ((size & 0x7f0000) >> 2) | ((size & 0x7f00) >> 1) | (size & 0x7f)
-            start_pos = 10 + size
+        print(f" Scanning {len(data):,} bytes untuk frame MP3...")
         
-        # Start from a safe position (skip at least 4KB)
-        safe_start = max(start_pos + 4096, 4096)
+        while i < len(data) - 4:
+            # Cek sync word
+            if data[i] == 0xFF and (data[i+1] & 0xE0) == 0xE0:
+                # Possible frame header
+                try:
+                    header = struct.unpack('>I', data[i:i+4])[0]
+                    
+                    # Validasi header
+                    if not self._is_valid_header(header):
+                        i += 1
+                        continue
+                    
+                    frame_length = self._get_frame_length(header)
+                    
+                    # Validasi frame length
+                    if frame_length > 0 and i + frame_length <= len(data):
+                        # ADDITIONAL CHECK: Cek apakah frame berikutnya juga valid
+                        next_frame_pos = i + frame_length
+                        
+                        if next_frame_pos + 4 <= len(data):
+                            # Check next frame sync
+                            if data[next_frame_pos] == 0xFF and (data[next_frame_pos+1] & 0xE0) == 0xE0:
+                                next_header = struct.unpack('>I', data[next_frame_pos:next_frame_pos+4])[0]
+                                
+                                if self._is_valid_header(next_header):
+                                    # Frame ini kemungkinan valid!
+                                    frames.append({
+                                        'offset': i,
+                                        'header_size': 4,
+                                        'frame_length': frame_length
+                                    })
+                                    consecutive_failures = 0
+                                    i += frame_length
+                                    continue
+                        else:
+                            # Frame terakhir - terima saja jika valid
+                            frames.append({
+                                'offset': i,
+                                'header_size': 4,
+                                'frame_length': frame_length
+                            })
+                            consecutive_failures = 0
+                            i += frame_length
+                            continue
+                    
+                    consecutive_failures += 1
+                    
+                except struct.error:
+                    pass
+            
+            consecutive_failures += 1
+            i += 1
+            
+            # Jika terlalu banyak failure, skip beberapa byte
+            if consecutive_failures > max_failures:
+                consecutive_failures = 0
         
-        # Generate positions every 8 bytes, skipping 0xFF bytes
-        pos = safe_start
-        while pos < len(mp3_data):
-            if mp3_data[pos] != 0xFF:
-                safe_positions.append(pos)
-            pos += 8
+        return frames
+
+    def _find_frames_robust(self, data: bytes) -> List[Dict]:
+        frames = []
         
-        return safe_positions
+        # Skip ID3 tags
+        offset = self._skip_id3_tags(data)
+        
+        if offset > 0:
+            print(f" ID3v2 tag terdeteksi, skip {offset} bytes")
+        
+        i = offset
+        frame_count = 0
+        
+        while i < len(data) - 4:
+            # Check sync word
+            if data[i] == 0xFF and (data[i+1] & 0xE0) == 0xE0:
+                try:
+                    header = struct.unpack('>I', data[i:i+4])[0]
+                    
+                    if not self._is_valid_header(header):
+                        i += 1
+                        continue
+                    
+                    frame_length = self._get_frame_length(header)
+                    
+                    if frame_length > 0 and i + frame_length <= len(data):
+                        # Verify next frame exists
+                        next_pos = i + frame_length
+                        
+                        # Last frame OR next frame is valid
+                        if next_pos >= len(data) - 4 or \
+                           (data[next_pos] == 0xFF and (data[next_pos+1] & 0xE0) == 0xE0):
+                            
+                            frames.append({
+                                'offset': i,
+                                'header_size': 4,
+                                'frame_length': frame_length
+                            })
+                            
+                            frame_count += 1
+                            i += frame_length
+                            
+                            # Progress indicator
+                            if frame_count % 1000 == 0:
+                                progress = (i / len(data)) * 100
+                                print(f"    Progress: {progress:.1f}% ({frame_count} frames)", end='\r')
+                            
+                            continue
+                
+                except (struct.error, ZeroDivisionError):
+                    pass
+            
+            i += 1
+        
+        print(f"\n Scanning selesai")
+        
+        return frames
     
-    def _generate_positions(self, seed: str, mp3_data: bytes, positions_needed: int, randomize: bool) -> List[int]:
-        """Generate positions for embedding/extracting data"""
-        safe_positions = self._generate_safe_positions(mp3_data)
+    def _calculate_capacity(self, frames: List[Dict], lsb_count: int) -> int:
+        """Hitung kapasitas penyimpanan dalam bytes"""
+        total_bits = 0
+        for frame in frames:
+            audio_data_size = frame['frame_length'] - frame['header_size']
+            total_bits += audio_data_size * lsb_count
         
-        if len(safe_positions) < positions_needed:
-            print(f"Warning: Only {len(safe_positions)} safe positions available, need {positions_needed}")
-            # Use all available positions
-            return safe_positions[:positions_needed] if positions_needed <= len(safe_positions) else safe_positions
+        return total_bits // 8
+    
+    def _generate_random_positions(self, total_positions: int, required_positions: int, 
+                                   seed: str) -> List[int]:
+        """Generate posisi random untuk embedding"""
+        rng = random.Random(self._generate_seed_hash(seed))
+        
+        if required_positions > total_positions:
+            raise ValueError("Data terlalu besar untuk kapasitas yang tersedia")
+        
+        # Generate shuffled positions
+        positions = list(range(total_positions))
+        rng.shuffle(positions)
+        
+        return positions[:required_positions]
+    
+    def _create_metadata(self, filename: str, filesize: int, encrypted: bool, 
+                        randomized: bool, lsb_count: int) -> bytes:
+        """Buat metadata untuk file tersembunyi"""
+        metadata = {
+            'version': self.VERSION,
+            'filename': filename,
+            'filesize': filesize,
+            'encrypted': encrypted,
+            'randomized': randomized,
+            'lsb_count': lsb_count,
+            'checksum': '' # diisi nanti ae lah
+        }
+        
+        metadata_json = json.dumps(metadata, separators=(',', ':'))
+        metadata_bytes = metadata_json.encode('utf-8')
+        
+        # Format: MAGIC_HEADER (8 bytes) + metadata_length (4 bytes) + metadata
+        header = self.MAGIC_HEADER
+        header += struct.pack('>I', len(metadata_bytes))
+        header += metadata_bytes
+        
+        return header
+    
+    def _parse_metadata(self, data: bytes) -> Tuple[Dict, int]:
+        """Parse metadata dari data tersembunyi"""
+        if not data.startswith(self.MAGIC_HEADER):
+            raise ValueError("Format data tidak valid - magic header tidak ditemukan")
+        
+        offset = len(self.MAGIC_HEADER)
+        metadata_length = struct.unpack('>I', data[offset:offset+4])[0]
+        offset += 4
+        
+        metadata_bytes = data[offset:offset+metadata_length]
+        metadata = json.loads(metadata_bytes.decode('utf-8'))
+        
+        return metadata, offset + metadata_length
+    
+    def _embed_bits(self, mp3_data: bytearray, frames: List[Dict], data_bits: str,
+                   lsb_count: int, randomize: bool, seed: str) -> int:
+        """Embed bits ke LSB audio data"""
+        total_positions = 0
+        position_map = []  # (frame_idx, byte_offset_in_frame)
+        
+        for frame_idx, frame in enumerate(frames):
+            audio_start = frame['offset'] + frame['header_size']
+            audio_end = frame['offset'] + frame['frame_length']
+            
+            for byte_pos in range(audio_start, audio_end):
+                position_map.append((frame_idx, byte_pos))
+                total_positions += 1
+        
+        # Hitung berapa posisi yang dibutuhkan
+        bits_needed = len(data_bits)
+        positions_needed = (bits_needed + lsb_count - 1) // lsb_count
         
         if randomize:
-            # Use random sampling but with consistent seed
-            # Important: To ensure reproducible results, we always generate the same 
-            # random sequence and then take the first positions_needed items
-            random.seed(seed)
-            
-            # Shuffle a copy of all safe positions to get consistent random order
-            shuffled_positions = safe_positions.copy()
-            random.shuffle(shuffled_positions)
-            
-            # Return the first positions_needed from the shuffled list
-            return shuffled_positions[:positions_needed]
+            # Generate random positions
+            random_indices = self._generate_random_positions(
+                total_positions, positions_needed, seed
+            )
+            selected_positions = [position_map[i] for i in random_indices]
         else:
-            # Use sequential positions starting from a FIXED seed-based offset
-            # This ensures the same starting point regardless of positions_needed
-            hash_obj = hashlib.md5(seed.encode())
-            start_index = int(hash_obj.hexdigest()[:8], 16) % 1000  # Fixed small range
-            return safe_positions[start_index:start_index + positions_needed]
-    
-    def _generate_flag_positions(self, seed: str, mp3_data: bytes) -> List[int]:
-        """Generate fixed positions for the 4-bit flag"""
-        # Use a different hash for flag positions to avoid conflict with data positions
-        hash_obj = hashlib.md5((seed + "_FLAG").encode())
-        start_offset = int(hash_obj.hexdigest()[:4], 16) % 1024 + 2048  # 2KB-3KB range
+            # Sequential positions
+            selected_positions = position_map[:positions_needed]
         
-        flag_positions = []
-        pos = start_offset
-        count = 0
-        while count < 4 and pos < len(mp3_data):
-            if mp3_data[pos] != 0xFF:  # Skip frame sync bytes
-                flag_positions.append(pos)
-                count += 1
-            pos += 1
+        # Embed bits
+        bit_index = 0
+        embedded_bits = 0
         
-        return flag_positions
+        for frame_idx, byte_pos in selected_positions:
+            if bit_index >= len(data_bits):
+                break
+            
+            # Ambil lsb_count bits
+            bits_to_embed = data_bits[bit_index:bit_index + lsb_count]
+            
+            # Pad jika kurang dari lsb_count
+            if len(bits_to_embed) < lsb_count:
+                bits_to_embed = bits_to_embed.ljust(lsb_count, '0')
+            
+            # Clear LSBs
+            mask = (0xFF << lsb_count) & 0xFF
+            mp3_data[byte_pos] = (mp3_data[byte_pos] & mask)
+            
+            # Set new LSBs
+            new_lsb = int(bits_to_embed, 2)
+            mp3_data[byte_pos] = mp3_data[byte_pos] | new_lsb
+            
+            bit_index += lsb_count
+            embedded_bits += lsb_count
+        
+        return embedded_bits
     
-    def validate_mp3_structure(self, mp3_path: str) -> bool:
-        """Validate basic MP3 structure to ensure playability"""
-        try:
-            with open(mp3_path, 'rb') as f:
-                data = f.read()
+    def _extract_bits(self, mp3_data: bytes, frames: List[Dict], num_bits: int,
+                     lsb_count: int, randomize: bool, seed: str) -> str:
+        """Extract bits dari LSB audio data"""
+        # Build position map
+        position_map = []
+        
+        for frame_idx, frame in enumerate(frames):
+            audio_start = frame['offset'] + frame['header_size']
+            audio_end = frame['offset'] + frame['frame_length']
             
-            if len(data) < 10:
-                return False
+            for byte_pos in range(audio_start, audio_end):
+                position_map.append((frame_idx, byte_pos))
+        
+        total_positions = len(position_map)
+        positions_needed = (num_bits + lsb_count - 1) // lsb_count
+        
+        if randomize:
+            random_indices = self._generate_random_positions(
+                total_positions, positions_needed, seed
+            )
+            selected_positions = [position_map[i] for i in random_indices]
+        else:
+            selected_positions = position_map[:positions_needed]
+        
+        # Extract bits
+        extracted_bits = []
+        
+        for frame_idx, byte_pos in selected_positions:
+            if len(extracted_bits) >= num_bits:
+                break
             
-            # Check for valid MP3 indicators
-            pos = 0
+            # Extract lsb_count bits
+            mask = (1 << lsb_count) - 1
+            lsb_value = mp3_data[byte_pos] & mask
             
-            # Skip ID3v2 if present
-            if data[:3] == b'ID3':
-                if len(data) >= 10:
-                    size = int.from_bytes(data[6:10], 'big')
-                    size = ((size & 0x7f000000) >> 3) | ((size & 0x7f0000) >> 2) | ((size & 0x7f00) >> 1) | (size & 0x7f)
-                    pos = 10 + size
-            
-            # Look for at least one valid MP3 frame
-            frame_found = False
-            search_limit = min(pos + 5000, len(data) - 4)  # Don't search entire file
-            
-            while pos < search_limit:
-                if data[pos] == 0xFF and (data[pos + 1] & 0xE0) == 0xE0:
-                    # Potential frame header found
-                    header = int.from_bytes(data[pos:pos+4], 'big')
-                    version = (header >> 19) & 0x3
-                    layer = (header >> 17) & 0x3
-                    bitrate_index = (header >> 12) & 0xF
-                    sampling_freq = (header >> 10) & 0x3
-                    
-                    # Check if it's a valid frame
-                    if (bitrate_index != 0 and bitrate_index != 15 and 
-                        sampling_freq != 3 and layer != 0):
-                        frame_found = True
-                        break
-                
-                pos += 1
-            
-            return frame_found
-            
-        except Exception as e:
-            print(f"MP3 validation error: {e}")
-            return False
-
-    def _string_to_bytes(self, text: str) -> bytes:
-        """Convert string to bytes"""
-        return text.encode('utf-8')
+            bits = format(lsb_value, f'0{lsb_count}b')
+            extracted_bits.append(bits)
+        
+        result = ''.join(extracted_bits)
+        return result[:num_bits]  # Trim to exact size
     
-    def _bytes_to_string(self, data: bytes) -> str:
-        """Convert bytes to string"""
-        try:
-            return data.decode('utf-8')
-        except:
-            return str(data)
+    def _embed_bits_with_offset(self, mp3_data: bytearray, frames: List[Dict], 
+                                data_bits: str, lsb_count: int, randomize: bool, 
+                                seed: str, offset_bits: int) -> int:
+        """
+        Embed bits dengan offset (skip posisi yang sudah digunakan)
+        
+        Args:
+            offset_bits: Jumlah bits yang sudah digunakan sebelumnya
+        """
+        # Build position map (sama seperti _embed_bits)
+        position_map = []
+        
+        for frame_idx, frame in enumerate(frames):
+            audio_start = frame['offset'] + frame['header_size']
+            audio_end = frame['offset'] + frame['frame_length']
+            
+            for byte_pos in range(audio_start, audio_end):
+                position_map.append((frame_idx, byte_pos))
+        
+        total_positions = len(position_map)
+        
+        # Skip posisi yang sudah digunakan oleh offset_bits
+        # offset_bits menggunakan LSB-1, jadi 1 bit per posisi
+        start_position = offset_bits  # Skip posisi yang sudah digunakan
+        
+        # Hitung berapa posisi yang dibutuhkan untuk data_bits dengan lsb_count
+        bits_needed = len(data_bits)
+        positions_needed = (bits_needed + lsb_count - 1) // lsb_count
+        
+        if randomize:
+            # Generate random positions, tapi skip yang sudah digunakan
+            available_positions = list(range(start_position, total_positions))
+            
+            if positions_needed > len(available_positions):
+                raise ValueError("Tidak cukup posisi tersisa untuk data!")
+            
+            rng = random.Random(self._generate_seed_hash(seed))
+            rng.shuffle(available_positions)
+            
+            random_indices = available_positions[:positions_needed]
+            selected_positions = [position_map[i] for i in random_indices]
+        else:
+            # Sequential, mulai dari start_position
+            end_position = start_position + positions_needed
+            
+            if end_position > total_positions:
+                raise ValueError("Tidak cukup posisi tersisa untuk data!")
+            
+            selected_positions = position_map[start_position:end_position]
+        
+        # Embed bits (sama seperti _embed_bits)
+        bit_index = 0
+        embedded_bits = 0
+        
+        for frame_idx, byte_pos in selected_positions:
+            if bit_index >= len(data_bits):
+                break
+            
+            bits_to_embed = data_bits[bit_index:bit_index + lsb_count]
+            
+            if len(bits_to_embed) < lsb_count:
+                bits_to_embed = bits_to_embed.ljust(lsb_count, '0')
+            
+            # Clear LSBs
+            mask = (0xFF << lsb_count) & 0xFF
+            mp3_data[byte_pos] = (mp3_data[byte_pos] & mask)
+            
+            # Set new LSBs
+            new_lsb = int(bits_to_embed, 2)
+            mp3_data[byte_pos] = mp3_data[byte_pos] | new_lsb
+            
+            bit_index += lsb_count
+            embedded_bits += lsb_count
+        
+        return embedded_bits
     
-    def _embed_bit(self, byte_val: int, bit: int) -> int:
-        """Embed a bit into the LSB of a byte"""
-        return (byte_val & 0xFE) | bit
+    def _extract_bits_with_offset(self, mp3_data: bytes, frames: List[Dict], 
+                                num_bits: int, lsb_count: int, randomize: bool, 
+                                seed: str, offset_bits: int) -> str:
+        """
+        Extract bits dengan offset (skip posisi yang sudah digunakan)
+        
+        Args:
+            offset_bits: Jumlah bits yang sudah digunakan sebelumnya (untuk metadata)
+        """
+        # Build position map
+        position_map = []
+        
+        for frame_idx, frame in enumerate(frames):
+            audio_start = frame['offset'] + frame['header_size']
+            audio_end = frame['offset'] + frame['frame_length']
+            
+            for byte_pos in range(audio_start, audio_end):
+                position_map.append((frame_idx, byte_pos))
+        
+        total_positions = len(position_map)
+        
+        # Skip posisi yang sudah digunakan oleh metadata (offset_bits)
+        start_position = offset_bits
+        
+        # Hitung berapa posisi yang dibutuhkan
+        positions_needed = (num_bits + lsb_count - 1) // lsb_count
+        
+        if randomize:
+            # Generate random positions dari available range
+            available_positions = list(range(start_position, total_positions))
+            
+            if positions_needed > len(available_positions):
+                raise ValueError(
+                    f"Tidak cukup posisi! Butuh {positions_needed}, "
+                    f"tersedia {len(available_positions)}"
+                )
+            
+            rng = random.Random(self._generate_seed_hash(seed))
+            rng.shuffle(available_positions)
+            
+            random_indices = available_positions[:positions_needed]
+            selected_positions = [position_map[i] for i in random_indices]
+        else:
+            # Sequential dari start_position
+            end_position = start_position + positions_needed
+            
+            if end_position > total_positions:
+                raise ValueError(
+                    f"Tidak cukup posisi! Butuh sampai {end_position}, "
+                    f"total {total_positions}"
+                )
+            
+            selected_positions = position_map[start_position:end_position]
+        
+        # Extract bits
+        extracted_bits = []
+        
+        for frame_idx, byte_pos in selected_positions:
+            if len(extracted_bits) * lsb_count >= num_bits:
+                break
+            
+            # Extract lsb_count bits
+            mask = (1 << lsb_count) - 1
+            lsb_value = mp3_data[byte_pos] & mask
+            
+            bits = format(lsb_value, f'0{lsb_count}b')
+            extracted_bits.append(bits)
+        
+        result = ''.join(extracted_bits)
+        return result[:num_bits]  # Trim to exact size
     
-    def _extract_bit(self, byte_val: int) -> int:
-        """Extract the LSB from a byte"""
-        return byte_val & 1
-    
-    def embed_file(self, mp3_path: str, hidden_file_path: str, output_path: str, 
-                   encrypt: bool, randomize: bool, seed: str, lsb_count: int = 1) -> bool:
-        """Embed a file into an MP3 file using specified number of LSBs"""
-        try:
-            # Validate LSB count
-            if lsb_count < 1 or lsb_count > 4:
-                print("Error: LSB count must be between 1 and 4")
-                return False
-                
-            print(f"Using {lsb_count} LSB(s) for embedding")
-            
-            # Validate input MP3 structure
-            if not self.validate_mp3_structure(mp3_path):
-                print("Warning: Input file may not be a valid MP3 file!")
-            
-            # Read the files
-            with open(mp3_path, 'rb') as mp3_file:
-                mp3_data = bytearray(mp3_file.read())
-            
-            with open(hidden_file_path, 'rb') as hidden_file:
-                hidden_data = hidden_file.read()
-            
-            # Get original filename
-            filename = os.path.basename(hidden_file_path)
-            
-            # Convert hidden data to string if needed and encrypt if requested
-            if encrypt:
-                # Convert to base64 for binary files to ensure it's text-safe
-                import base64
-                hidden_text = base64.b64encode(hidden_data).decode('ascii')
-                encrypted_text = VigenereCipher.encrypt(hidden_text, seed)
-                payload = self._string_to_bytes(encrypted_text)
-            else:
-                payload = hidden_data
-            
-            # Create metadata: filename length + filename + data length
-            filename_bytes = filename.encode('utf-8')
-            metadata = len(filename_bytes).to_bytes(2, 'big') + filename_bytes + len(payload).to_bytes(4, 'big')
-            
-            # Complete payload: magic header + metadata + actual data + end marker
-            complete_payload = self.magic_header + metadata + payload + self.end_marker
-            
-            print(f"Complete payload size: {len(complete_payload)} bytes")
-            
-            # === EMBED 4-BIT FLAG FIRST ===
-            flag_bits = self._create_flag_bits(randomize, encrypt, lsb_count)
-            flag_positions = self._generate_flag_positions(seed, mp3_data)
-            
-            if len(flag_positions) < 4:
-                print("Error: Cannot find enough positions for flag bits")
-                return False
-            
-            # Embed flag bits (always use 1-LSB for flags)
-            for i, bit in enumerate(flag_bits):
-                pos = flag_positions[i]
-                mp3_data[pos] = self._embed_bit(mp3_data[pos], bit)
-            
-            print(f"Flag embedded: randomize={randomize}, encrypt={encrypt}, lsb_count={lsb_count}")
-            print(f"Flag bits: {flag_bits}")
-            print(f"Flag positions: {flag_positions}")
-            
-            # === EMBED MAIN PAYLOAD ===
-            # Calculate positions needed for payload
-            if lsb_count == 1:
-                positions_needed = len(complete_payload) * 8  # 8 positions per byte for 1-LSB
-            else:
-                total_bits = len(complete_payload) * 8
-                positions_needed = (total_bits + lsb_count - 1) // lsb_count  # Ceiling division
-            
-            print(f"Positions needed for payload: {positions_needed}")
-            
-            # Generate positions for payload data
-            positions = self._generate_positions(seed, mp3_data, positions_needed, randomize)
-            
-            # Remove flag positions from available positions to avoid conflicts
-            positions = [pos for pos in positions if pos not in flag_positions]
-            
-            print(f"Available positions after flag exclusion: {len(positions)}")
-            
-            # Check if we have enough positions
-            if len(positions) < positions_needed:
-                print(f"Error: Not enough positions. Need {positions_needed}, have {len(positions)}")
-                return False
-            
-            # Embed the payload
-            if lsb_count == 1:
-                # Traditional single-bit embedding
-                bit_index = 0
-                for byte_val in complete_payload:
-                    for bit_pos in range(8):
-                        if bit_index < len(positions):
-                            bit = (byte_val >> (7 - bit_pos)) & 1
-                            pos = positions[bit_index]
-                            mp3_data[pos] = self._embed_bit(mp3_data[pos], bit)
-                            bit_index += 1
-            else:
-                # Multi-LSB embedding
-                all_bits = []
-                for byte_val in complete_payload:
-                    for bit_pos in range(8):
-                        all_bits.append((byte_val >> (7 - bit_pos)) & 1)
-                
-                bit_index = 0
-                pos_index = 0
-                while bit_index < len(all_bits) and pos_index < len(positions):
-                    # Collect bits for this position
-                    bits_to_embed = 0
-                    actual_bits = min(lsb_count, len(all_bits) - bit_index)
-                    
-                    for i in range(actual_bits):
-                        bit = all_bits[bit_index + i]
-                        bits_to_embed |= (bit << (actual_bits - 1 - i))
-                    
-                    # Embed the bits
-                    pos = positions[pos_index]
-                    mp3_data[pos] = self._embed_bits(mp3_data[pos], bits_to_embed, actual_bits)
-                    
-                    bit_index += actual_bits
-                    pos_index += 1
-            
-            # Write the modified MP3
-            with open(output_path, 'wb') as output_file:
-                output_file.write(mp3_data)
-            
-            # Validate output MP3 structure
-            if self.validate_mp3_structure(output_path):
-                print(f"File '{hidden_file_path}' successfully embedded into '{output_path}'")
-                print("✓ Output MP3 structure validated - should be playable")
-            else:
-                print(f"File '{hidden_file_path}' embedded into '{output_path}' but MP3 structure may be damaged")
-                print("⚠ Output file may not be playable")
-            
-            return True
-            
-        except Exception as e:
-            print(f"Error embedding file: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return False
+    def embed_file(self, mp3_path: str, hidden_file_path: str, output_path: str,
+                encrypt: bool, randomize: bool, seed: str, lsb_count: int = 1) -> bool:
+        """Embed file ke dalam MP3"""
+        print("="*60)
+        print("MP3 LSB STEGANOGRAPHY - EMBED MODE")
+        print("="*60)
+        
+        # Baca file MP3
+        print(f"\n Membaca carrier MP3: {mp3_path}")
+        with open(mp3_path, 'rb') as f:
+            mp3_data = bytearray(f.read())
+        print(f"     Ukuran: {len(mp3_data):,} bytes")
+        
+        # Baca file rahasia
+        print(f"\n Membaca file rahasia: {hidden_file_path}")
+        with open(hidden_file_path, 'rb') as f:
+            secret_data = f.read()
+        
+        filename = os.path.basename(hidden_file_path)
+        original_size = len(secret_data)
+        print(f"     Nama file: {filename}")
+        print(f"     Ukuran original: {original_size:,} bytes")
+        
+        # Calculate checksum
+        checksum = hashlib.sha256(secret_data).hexdigest()
+        print(f"     SHA256: {checksum[:16]}...")
+        
+        # Enkripsi jika diminta
+        if encrypt:
+            print(f"\n Mengenkripsi data file...")
+            secret_data_encrypted = VigenereCipher.encrypt(secret_data, seed)
+            print(f"     Data terenkripsi: {len(secret_data_encrypted)} bytes")
+            secret_data_to_embed = secret_data_encrypted
+        else:
+            secret_data_to_embed = secret_data
+        
+        # Buat metadata
+        print(f"\n Membuat metadata...")
+        metadata_header = self._create_metadata(
+            filename, original_size, encrypt, randomize, lsb_count
+        )
+        
+        checksum_bytes = bytes.fromhex(checksum)
+        
+        # ===== STRUKTUR DATA =====
+        # PART 1: Metadata + Checksum (SELALU LSB-1, Sequential)
+        # PART 2: File Data (Gunakan LSB sesuai parameter, randomize sesuai parameter)
+        
+        part1_metadata = metadata_header + checksum_bytes
+        part2_filedata = secret_data_to_embed
+        
+        print(f"     Part 1 (Metadata+Checksum): {len(part1_metadata)} bytes")
+        print(f"      → Akan di-embed dengan: LSB-1, Sequential")
+        print(f"     Part 2 (File Data): {len(part2_filedata)} bytes")
+        print(f"      → Akan di-embed dengan: LSB-{lsb_count}, {'Random' if randomize else 'Sequential'}")
+        
+        # Parse MP3 frames
+        print(f"\n Menganalisis struktur MP3...")
+        frames = self._find_frames_robust(mp3_data)
+        print(f"     Ditemukan {len(frames)} frame")
+        
+        # Hitung kapasitas
+        capacity_part1 = self._calculate_capacity(frames, 1)  # LSB-1 untuk metadata
+        capacity_part2 = self._calculate_capacity(frames, lsb_count)  # LSB-n untuk data
+        
+        print(f"\n Kapasitas:")
+        print(f"     Part 1 capacity (LSB-1): {capacity_part1:,} bytes")
+        print(f"     Part 2 capacity (LSB-{lsb_count}): {capacity_part2:,} bytes")
+        
+        # Validasi kapasitas
+        if len(part1_metadata) > capacity_part1:
+            raise ValueError(f"Metadata terlalu besar! {len(part1_metadata)} > {capacity_part1}")
+        
+        # Hitung sisa kapasitas setelah metadata
+        # Part 1 menggunakan beberapa posisi dengan LSB-1
+        positions_used_by_part1 = len(part1_metadata) * 8  # bits needed for part1
+        
+        # Kapasitas tersisa untuk part 2
+        total_positions = sum(f['frame_length'] - f['header_size'] for f in frames)
+        positions_remaining = total_positions - positions_used_by_part1
+        capacity_remaining = (positions_remaining * lsb_count) // 8
+        
+        print(f"     Posisi digunakan Part 1: {positions_used_by_part1:,} bits")
+        print(f"     Kapasitas tersisa Part 2: {capacity_remaining:,} bytes")
+        print(f"     Part 2 butuh: {len(part2_filedata):,} bytes")
+        
+        if len(part2_filedata) > capacity_remaining:
+            raise ValueError(
+                f"File data terlalu besar! "
+                f"Butuh {len(part2_filedata):,} bytes, tersisa {capacity_remaining:,} bytes"
+            )
+        
+        # ===== EMBED PART 1: METADATA + CHECKSUM (LSB-1, Sequential) =====
+        print(f"\n Embedding Part 1 (Metadata+Checksum)...")
+        part1_bits = ''.join(format(byte, '08b') for byte in part1_metadata)
+        
+        embedded_bits_part1 = self._embed_bits(
+            mp3_data, frames, part1_bits,
+            lsb_count=1,        # FIXED: LSB-1
+            randomize=False,    # FIXED: Sequential
+            seed=seed
+        )
+        
+        positions_used_part1 = embedded_bits_part1 // 1 
+        
+        print(f"     Part 1 embedded: {embedded_bits_part1:,} bits ({embedded_bits_part1//8} bytes)")
+        
+        # ===== EMBED PART 2: FILE DATA (LSB-n, Random/Sequential sesuai parameter) =====
+        print(f"\n Embedding Part 2 (File Data)...")
+        print(f"     LSB count: {lsb_count}")
+        print(f"     Randomize: {randomize}")
+        
+        part2_bits = ''.join(format(byte, '08b') for byte in part2_filedata)
+        
+        # Embed part 2 SETELAH part 1
+        embedded_bits_part2 = self._embed_bits_with_offset(
+            mp3_data, frames, part2_bits,
+            lsb_count=lsb_count,
+            randomize=randomize,
+            seed=seed,
+            offset_bits=embedded_bits_part1  # Mulai setelah part 1
+        )
+        
+        print(f"     Part 2 embedded: {embedded_bits_part2:,} bits ({embedded_bits_part2//8} bytes)")
+        print(f"     Total embedded: {embedded_bits_part1 + embedded_bits_part2:,} bits")
+        
+        # Simpan file
+        print(f"\n Menyimpan file stego: {output_path}")
+        with open(output_path, 'wb') as f:
+            f.write(mp3_data)
+        
+        output_size = os.path.getsize(output_path)
+        print(f"     Ukuran output: {output_size:,} bytes")
+        
+        print("\n" + "="*60)
+        print("EMBED BERHASIL!")
+        print("="*60)
+        print(f"File output: {output_path}")
+        print(f"Seed: {seed}")
+        print(f"Embedding scheme:")
+        print(f"    Part 1 (Metadata): LSB-1, Sequential")
+        print(f"    Part 2 (Data): LSB-{lsb_count}, {'Random' if randomize else 'Sequential'}")
+        print("="*60)
+        
+        return True
     
     def extract_file(self, stego_mp3_path: str, seed: str, output_dir: str = ".") -> bool:
-        """Extract a hidden file from an MP3 file using flag-based detection"""
+        """Extract file dari stego MP3"""
+        print("="*60)
+        print("MP3 LSB STEGANOGRAPHY - EXTRACT MODE")
+        print("="*60)
+        
+        # ... (baca file dan parse frames sama) ...
+        
+        # ===== EXTRACT PART 1: METADATA (SELALU LSB-1, Sequential) =====
+        print(f"\n Mengekstrak Part 1 (Metadata)...")
+        
+        metadata_max_bits = 2048 * 8
+        print(f"\n Membaca stego MP3: {stego_mp3_path}")
+        with open(stego_mp3_path, 'rb') as f:
+            mp3_data = f.read()  # ← DEFINISI mp3_data
+        print(f"     Ukuran: {len(mp3_data):,} bytes")
+        print(f"\n Menganalisis struktur MP3...")
+        frames = self._find_frames_robust(mp3_data)  # ← DEFINISI frames
+        print(f"     Ditemukan {len(frames)} frame")
+        
+        part1_bits = self._extract_bits(
+            mp3_data, frames, metadata_max_bits,
+            lsb_count=1,     # FIXED
+            randomize=False, # FIXED
+            seed=seed
+        )
+        
+        # Convert to bytes
+        part1_bytes = bytearray()
+        for i in range(0, len(part1_bits), 8):
+            byte = int(part1_bits[i:i+8], 2)
+            part1_bytes.append(byte)
+        
+        # Parse metadata
         try:
-            # Read the steganographic MP3
-            with open(stego_mp3_path, 'rb') as mp3_file:
-                mp3_data = mp3_file.read()
-            
-            print("Extracting flag bits...")
-            
-            # === EXTRACT 4-BIT FLAG FIRST ===
-            flag_positions = self._generate_flag_positions(seed, mp3_data)
-            
-            if len(flag_positions) < 4:
-                print("Error: Cannot find flag positions")
-                return False
-            
-            print(f"Flag positions: {flag_positions}")
-            
-            # Extract flag bits
-            flag_bits = []
-            for pos in flag_positions:
-                if pos < len(mp3_data):
-                    bit = self._extract_bit(mp3_data[pos])
-                    flag_bits.append(bit)
-                else:
-                    print("Error: Flag position out of range")
-                    return False
-            
-            # Parse flag bits to get parameters
-            randomize, encrypt, lsb_count = self._parse_flag_bits(flag_bits)
-            
-            print(f"Flag extracted: randomize={randomize}, encrypt={encrypt}, lsb_count={lsb_count}")
-            print(f"Flag bits: {flag_bits}")
-            
-            # === EXTRACT MAIN PAYLOAD ===
-            # Generate positions using a large number to ensure we get the same sequence as embedding
-            # The key insight: we need to use the same start_index regardless of how many positions we need
-            max_possible_positions = 10000  # Large enough for any reasonable payload
-            all_positions = self._generate_positions(seed, mp3_data, max_possible_positions, randomize)
-            
-            # Remove flag positions from extraction positions
-            all_positions = [pos for pos in all_positions if pos not in flag_positions]
-            
-            print(f"Generated {len(all_positions)} positions for extraction")
-            
-            if not all_positions:
-                print("Error: No valid positions for extraction")
-                return False
-            
-            # Extract data based on LSB count
-            if lsb_count == 1:
-                # Traditional single-bit extraction
-                # Extract a reasonable amount of data to find magic header and payload
-                extracted_bits = []
-                for i, pos in enumerate(all_positions):
-                    if i >= 5000:  # Limit to first 5000 positions to avoid extracting too much
-                        break
-                    if pos < len(mp3_data):
-                        bit = self._extract_bit(mp3_data[pos])
-                        extracted_bits.append(bit)
-                    else:
-                        break
-                
-                # Convert bits to bytes
-                extracted_bytes = []
-                for i in range(0, len(extracted_bits), 8):
-                    if i + 7 < len(extracted_bits):
-                        byte_val = 0
-                        for j in range(8):
-                            byte_val |= (extracted_bits[i + j] << (7 - j))
-                        extracted_bytes.append(byte_val)
-            else:
-                # Multi-LSB extraction
-                all_extracted_bits = []
-                
-                for i, pos in enumerate(all_positions):
-                    if i >= 2500:  # Limit positions for multi-LSB
-                        break
-                    if pos < len(mp3_data):
-                        # Extract multiple bits from this position
-                        bits = self._extract_bits(mp3_data[pos], lsb_count)
-                        
-                        # Convert bits back to individual bit array
-                        for j in range(lsb_count):
-                            bit = (bits >> (lsb_count - 1 - j)) & 1
-                            all_extracted_bits.append(bit)
-                    else:
-                        break
-                
-                # Convert bit array to bytes
-                extracted_bytes = []
-                for i in range(0, len(all_extracted_bits), 8):
-                    if i + 7 < len(all_extracted_bits):
-                        byte_val = 0
-                        for j in range(8):
-                            byte_val |= (all_extracted_bits[i + j] << (7 - j))
-                        extracted_bytes.append(byte_val)
-            
-            extracted_data = bytes(extracted_bytes)
-            print(f"Extracted {len(extracted_data)} bytes of data")
-            
-            # Look for magic header
-            magic_pos = extracted_data.find(self.magic_header)
-            
-            if magic_pos == -1:
-                print("Error: Magic header not found.")
-                print(f"First 100 bytes of extracted data: {extracted_data[:100]}")
-                print(f"Looking for magic header: {self.magic_header}")
-                return False
-            
-            print(f"Magic header found at position {magic_pos}!")
-            
-            # Start parsing from after magic header
-            data_start = magic_pos + len(self.magic_header)
-            
-            if data_start + 6 > len(extracted_data):  # Need at least 6 bytes for metadata
-                print("Error: Not enough data after magic header")
-                return False
-            
-            # Extract filename length (2 bytes)
-            filename_len = int.from_bytes(extracted_data[data_start:data_start+2], 'big')
-            data_start += 2
-            
-            if data_start + filename_len + 4 > len(extracted_data):
-                print("Error: Invalid filename length")
-                return False
-            
-            # Extract filename
-            filename = extracted_data[data_start:data_start+filename_len].decode('utf-8')
-            data_start += filename_len
-            
-            # Extract data length (4 bytes)
-            data_len = int.from_bytes(extracted_data[data_start:data_start+4], 'big')
-            data_start += 4
-            
-            if data_start + data_len > len(extracted_data):
-                print("Error: Invalid data length or insufficient extracted data")
-                print(f"Need {data_len} bytes but only {len(extracted_data) - data_start} available")
-                return False
-            
-            # Extract the actual data
-            file_data = extracted_data[data_start:data_start+data_len]
-            
-            # Use the flag to determine if decryption is needed
-            final_data = file_data
-            
-            if encrypt:
-                try:
-                    # Decrypt the data
-                    import base64
-                    decrypted_text = VigenereCipher.decrypt(file_data.decode('ascii'), seed)
-                    final_data = base64.b64decode(decrypted_text.encode('ascii'))
-                    print("Data was encrypted and has been decrypted.")
-                except Exception as e:
-                    print(f"Decryption failed: {e}")
-                    return False
-            else:
-                print("Data was not encrypted.")
-            
-            # Save the extracted file
-            output_path = os.path.join(output_dir, filename)
-            with open(output_path, 'wb') as output_file:
-                output_file.write(final_data)
-            
-            print(f"File successfully extracted to: {output_path}")
-            print(f"Original filename: {filename}")
-            print(f"Data length: {len(final_data)} bytes")
-            print(f"Extraction used: {lsb_count}-LSB, randomize={randomize}, encrypt={encrypt}")
-            return True
-            
+            metadata, data_start_byte = self._parse_metadata(bytes(part1_bytes))
         except Exception as e:
-            print(f"Error extracting file: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return False
+            print(f"\nERROR: Gagal parsing metadata")
+            print(f"    First 32 bytes: {part1_bytes[:32].hex()}")
+            print(f"    Expected: {self.MAGIC_HEADER.hex()}")
+            raise ValueError(f"Gagal parsing metadata: {e}")
+        
+        print(f"     Metadata parsed!")
+        print(f"     Filename: {metadata['filename']}")
+        print(f"     Filesize: {metadata['filesize']:,} bytes")
+        print(f"     Encrypted: {metadata['encrypted']}")
+        print(f"     Randomized: {metadata['randomized']}")
+        print(f"     LSB count: {metadata['lsb_count']}")
+        
+        # ===== EXTRACT PART 2: FILE DATA (sesuai metadata) =====
+        print(f"\n Mengekstrak Part 2 (File Data)...")
+        print(f"     LSB count: {metadata['lsb_count']}")
+        print(f"     Randomize: {metadata['randomized']}")
+        
+        checksum_size = 32
+        part2_size = checksum_size + metadata['filesize']
+        part2_bits_needed = part2_size * 8
+        
+        # Hitung offset (part 1 menggunakan LSB-1)
+        offset_bits = data_start_byte * 8
+        
+        print(f"     Offset: {offset_bits} bits ({data_start_byte} bytes)")
+        print(f"     Part 2 size: {part2_size} bytes")
+        
+        # Extract part 2
+        part2_bits = self._extract_bits_with_offset(
+            mp3_data, frames, part2_bits_needed,
+            lsb_count=metadata['lsb_count'],
+            randomize=metadata['randomized'],
+            seed=seed,
+            offset_bits=offset_bits
+        )
+        
+        # Convert to bytes
+        part2_bytes = bytearray()
+        for i in range(0, len(part2_bits), 8):
+            if i + 8 <= len(part2_bits):
+                byte = int(part2_bits[i:i+8], 2)
+                part2_bytes.append(byte)
+        
+        print(f"     Part 2 extracted: {len(part2_bytes)} bytes")
+        
+        # Pisahkan checksum dan data
+        stored_checksum = part2_bytes[:checksum_size].hex()
+        file_data_encrypted = bytes(part2_bytes[checksum_size:checksum_size + metadata['filesize']])
+        
+        # Decrypt jika perlu
+        if metadata['encrypted']:
+            print(f"\n Mendekripsi data...")
+            file_data = VigenereCipher.decrypt(file_data_encrypted, seed)
+            print(f"     Decrypted: {len(file_data)} bytes")
+        else:
+            file_data = file_data_encrypted
+        
+        # Verify checksum
+        print(f"\n Verifikasi checksum...")
+        calculated_checksum = hashlib.sha256(file_data).hexdigest()
+        
+        print(f"     Stored:     {stored_checksum[:16]}...")
+        print(f"     Calculated: {calculated_checksum[:16]}...")
+        
+        if stored_checksum != calculated_checksum:
+            print(f"    WARNING: Checksum tidak cocok!")
+            response = input("\n    Lanjutkan simpan file? (y/n): ").strip().lower()
+            if response != 'y':
+                print("\n Extract dibatalkan")
+                return False
+        else:
+            print(f"     Checksum VALID!")
+        
+        # Simpan file
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        
+        output_path = os.path.join(output_dir, metadata['filename'])
+        
+        # Handle jika file sudah ada
+        if os.path.exists(output_path):
+            base, ext = os.path.splitext(metadata['filename'])
+            counter = 1
+            while os.path.exists(output_path):
+                output_path = os.path.join(output_dir, f"{base}_{counter}{ext}")
+                counter += 1
+        
+        print(f"\n Menyimpan file: {output_path}")
+        with open(output_path, 'wb') as f:
+            f.write(file_data)
+        
+        print(f"     File tersimpan: {len(file_data):,} bytes")
+        
+        print("\n" + "="*60)
+        print("EXTRACT BERHASIL!")
+        print("="*60)
+        print(f"File: {output_path}")
+        print(f"Size: {len(file_data):,} bytes")
+        print(f" Checksum: {'VALID' if stored_checksum == calculated_checksum else 'INVALID'}")
+        print("="*60)
+        
+        return True
 
+
+    
 def main():
+    print("MP3 LSB STEGANOGRAPHY TOOL")
+
     stego = MP3Steganography()
     
-    while True:
-        print("\n=== MP3 Steganography Tool ===")
-        print("1. Embed file into MP3")
-        print("2. Extract file from MP3")
-        print("3. Exit")
+    print("\nPilih Mode:")
+    print("  1. EMBED")
+    print("  2. EXTRACT")
+    print("  3. Cek PSNR")
+
+    choice = input("\nPilihan (1/2/3): ").strip()
+
+    if choice == '1':
+        # ============ MODE EMBED ============
+        print("\n" + "="*60)
+        print("MODE: EMBED FILE")
+        print("="*60)
         
-        choice = input("\nEnter your choice (1-3): ").strip()
+        # Input files
+        mp3_path = input("\nPath file MP3 carrier: ").strip()
+        hidden_file = input("Path file yang akan disembunyikan: ").strip()
+        output_path = input("Path output stego MP3: ").strip()
         
-        if choice == '1':
-            print("\n--- Embed File ---")
-            mp3_file = input("Enter MP3 file path: ").strip()
-            hidden_file = input("Enter file to hide: ").strip()
-            
-            if not os.path.exists(mp3_file):
-                print("MP3 file not found!")
-                continue
-            if not os.path.exists(hidden_file):
-                print("Hidden file not found!")
-                continue
-            
-            encrypt = input("Encrypt the hidden file? (y/n): ").strip().lower() == 'y'
-            randomize = input("Randomize starting bit positions? (y/n): ").strip().lower() == 'y'
-            
-            # LSB count selection
-            print("\nSelect LSB count (bits to modify per byte):")
-            print("1 = 1 bit (most secure, least capacity)")
-            print("2 = 2 bits (balanced)")
-            print("3 = 3 bits (higher capacity)")
-            print("4 = 4 bits (highest capacity, less secure)")
-            
-            while True:
-                try:
-                    lsb_count = int(input("Enter LSB count (1-4): ").strip())
-                    if 1 <= lsb_count <= 4:
-                        break
-                    else:
-                        print("Please enter a number between 1 and 4.")
-                except ValueError:
-                    print("Please enter a valid number.")
-            
-            seed = input("Enter seed string: ").strip()
-            
-            if not seed:
-                print("Seed cannot be empty!")
-                continue
-            
-            output_file = input("Enter output MP3 file path: ").strip()
-            if not output_file:
-                output_file = f"stego_{os.path.basename(mp3_file)}"
-            
-            success = stego.embed_file(mp3_file, hidden_file, output_file, encrypt, randomize, seed, lsb_count)
-            if success:
-                print(f"Steganographic MP3 saved as: {output_file}")
-                print(f"Settings embedded in flag: randomize={randomize}, encrypt={encrypt}, lsb_count={lsb_count}")
+        if not output_path:
+            output_path = "stego_output.mp3"
         
-        elif choice == '2':
-            print("\n--- Extract File ---")
-            stego_mp3 = input("Enter steganographic MP3 file path: ").strip()
-            seed = input("Enter seed string: ").strip()
-            
-            if not os.path.exists(stego_mp3):
-                print("MP3 file not found!")
-                continue
-            
-            if not seed:
-                print("Seed cannot be empty!")
-                continue
-            
-            output_dir = input("Enter output directory (press Enter for current directory): ").strip()
-            if not output_dir:
-                output_dir = "."
-            
-            print("Note: Extraction parameters will be automatically detected from embedded flag.")
-            stego.extract_file(stego_mp3, seed, output_dir)
+        # LSB count
+        print("\nLSB Count (jumlah bit per byte):")
+        print("   1 = Paling aman, kapasitas kecil")
+        print("   2 = Seimbang")
+        print("   3 = Kapasitas besar, lebih berisiko")
+        print("   4 = Kapasitas maksimal, audio rusak")
         
-        elif choice == '3':
-            print("Goodbye!")
-            break
+        lsb_input = input("LSB count (1-4) [default: 1]: ").strip()
+        lsb_count = int(lsb_input) if lsb_input else 1
         
-        else:
-            print("Invalid choice! Please try again.")
+        # Encryption
+        print("\nEnkripsi:")
+        encrypt_input = input("Enkripsi data? (y/n) [default: y]: ").strip().lower()
+        encrypt = encrypt_input != 'n'
+        
+        # Randomization
+        print("\nRandomisasi Posisi:")
+        print("    Sequential: Embedding berurutan (cepat)")
+        print("    Random: Embedding acak (lebih aman)")
+        random_input = input("Gunakan posisi random? (y/n) [default: y]: ").strip().lower()
+        randomize = random_input != 'n'
+        
+        # Seed
+        print("\nSeed (password untuk enkripsi & randomisasi):")
+        seed = input("Masukkan seed: ").strip()
+        
+        if not seed:
+            print("Seed tidak boleh kosong!")
+            return
+        
+        # Konfirmasi
+        print("\n" + "="*60)
+        print("RINGKASAN:")
+        print("="*60)
+        print(f"  Carrier MP3    : {mp3_path}")
+        print(f"  File rahasia   : {hidden_file}")
+        print(f"  Output         : {output_path}")
+        print(f"  LSB count      : {lsb_count}")
+        print(f"  Enkripsi       : {' Ya' if encrypt else 'Tidak'}")
+        print(f"  Randomisasi    : {' Ya' if randomize else 'Tidak'}")
+        print(f"  Seed           : {'*' * len(seed)}")
+        print("="*60)
+        
+        confirm = input("\nLanjutkan? (y/n): ").strip().lower()
+        
+        if confirm != 'y':
+            print("Dibatalkan")
+            return
+        
+        # Execute embed
+        try:
+            stego.embed_file(
+                mp3_path=mp3_path,
+                hidden_file_path=hidden_file,
+                output_path=output_path,
+                encrypt=encrypt,
+                randomize=randomize,
+                seed=seed,
+                lsb_count=lsb_count
+            )
+        except Exception as e:
+            print(f"\nERROR: {e}")
+            traceback.print_exc()
+    
+    elif choice == '2':
+        # ============ MODE EXTRACT ============
+        print("\n" + "="*60)
+        print("MODE: EXTRACT FILE")
+        print("="*60)
+        
+        stego_path = input("\nPath file stego MP3: ").strip()
+        seed = input("Seed yang digunakan saat embed: ").strip()
+        
+        output_dir = input("Directory output [default: .]: ").strip()
+        if not output_dir:
+            output_dir = "."
+        
+        # Konfirmasi
+        print("\n" + "="*60)
+        print("RINGKASAN:")
+        print("="*60)
+        print(f"  Stego MP3      : {stego_path}")
+        print(f"  Seed           : {'*' * len(seed)}")
+        print(f"  Output dir     : {output_dir}")
+        print("="*60)
+        
+        confirm = input("\nLanjutkan? (y/n): ").strip().lower()
+        
+        if confirm != 'y':
+            print("Dibatalkan")
+            return
+        
+        # Execute extract
+        try:
+            stego.extract_file(
+                stego_mp3_path=stego_path,
+                seed=seed,
+                output_dir=output_dir
+            )
+        except Exception as e:
+            print(f"\nERROR: {e}")
+            traceback.print_exc()
+            
+    elif choice == '3':
+        path1 = input("\nPath file MP3 pertama: ").strip()
+        path2 = input("Path file MP3 kedua: ").strip()
+        print("\n====Menghitung PSNR...=====")
+        print(f'PSNR VALUE : {psnr(path1, path2)} dB')
+    
+    else:
+        print("Pilihan tidak valid!\nkeluar dari program.")
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nProgram dihentikan oleh user")
+    except Exception as e:
+        print(f"\nERROR: {e}")
+        traceback.print_exc()
